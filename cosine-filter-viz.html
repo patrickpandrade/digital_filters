@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Filtro Cosseno — Estimador de Fasor (Deslocamento N/4)</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0c0c14; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+
+const N = 16;
+const N4 = N / 4; // = 4
+const TOTAL = 2 * N; // 32 samples (2 cycles)
+const TAU = 2 * Math.PI;
+
+const COMPONENTS = [
+  { freq: 1, amp: 1.0, label: "1ª (fund.)" },
+  { freq: 2, amp: 0.7, label: "2ª harm." },
+  { freq: 3, amp: 0.6, label: "3ª harm." },
+  { freq: 5, amp: 0.4, label: "5ª harm." },
+  { freq: 7, amp: 0.3, label: "7ª harm." },
+];
+
+/* Generate 2-cycle signal (32 samples) */
+function generateSignal(components) {
+  const samples = [];
+  for (let n = 0; n < TOTAL; n++) {
+    let val = 0;
+    for (const c of components) val += c.amp * Math.sin((TAU * c.freq * n) / N);
+    samples.push(val);
+  }
+  return samples;
+}
+
+/* Cosine filter for harmonic h */
+function computeCosineFilter(signal32, h) {
+  const cosVals = [];
+  const prodRe = [];
+  const prodIm = [];
+  const samplesRe = []; // n = 0..15
+  const samplesIm = []; // n = 4..19
+
+  let reSum = 0, imSum = 0;
+
+  for (let n = 0; n < N; n++) {
+    const cosVal = Math.cos((TAU * h * n) / N);
+    cosVals.push(cosVal);
+
+    const xRe = signal32[n];         // x[n], n=0..15
+    const xIm = signal32[n + N4];    // x[n + N/4], n=0..15 → samples 4..19
+
+    samplesRe.push(xRe);
+    samplesIm.push(xIm);
+
+    const pRe = xRe * cosVal;
+    const pIm = xIm * cosVal;
+
+    prodRe.push(pRe);
+    prodIm.push(pIm);
+
+    reSum += pRe;
+    imSum += pIm;
+  }
+
+  const realPart = (2 / N) * reSum;
+  const imagPart = -(2 / N) * imSum;
+  const mag = Math.sqrt(realPart * realPart + imagPart * imagPart);
+  const angleDeg = Math.atan2(imagPart, realPart) * (180 / Math.PI);
+
+  return {
+    realPart, imagPart, mag, angleDeg,
+    cosVals, prodRe, prodIm, samplesRe, samplesIm,
+    reSumRaw: reSum, imSumRaw: imSum,
+  };
+}
+
+/* Compute frequency response: sweep f, apply original cosine filter at harmonic h */
+function computeFreqResponse(h, numPoints) {
+  const maxF = N / 2;
+  const points = [];
+  for (let i = 0; i <= numPoints; i++) {
+    const f = (i / numPoints) * maxF;
+    const testSig = [];
+    for (let n = 0; n < TOTAL; n++) testSig.push(Math.sin((TAU * f * n) / N));
+    let reSum = 0, imSum = 0;
+    for (let n = 0; n < N; n++) {
+      const cosVal = Math.cos((TAU * h * n) / N);
+      reSum += testSig[n] * cosVal;
+      imSum += testSig[n + N4] * cosVal;
+    }
+    const realPart = (2 / N) * reSum;
+    const imagPart = -(2 / N) * imSum;
+    points.push({ f, mag: Math.sqrt(realPart * realPart + imagPart * imagPart) });
+  }
+  return points;
+}
+
+/* ───────────── Responsive SVG ───────────── */
+function RSVG({ vw, vh, children }) {
+  return (
+    <svg viewBox={`0 0 ${vw} ${vh}`} preserveAspectRatio="xMidYMid meet"
+      style={{ width: "100%", height: "auto", display: "block" }}>
+      {children}
+    </svg>
+  );
+}
+
+/* ───────────── Mini graph ───────────── */
+function MiniGraph({ data, color, label, fillBar = false, startIndex = 0 }) {
+  const vw = 460, vh = 78;
+  const pad = { t: 16, b: 18, l: 30, r: 10 };
+  const w = vw - pad.l - pad.r;
+  const h = vh - pad.t - pad.b;
+  const max = Math.max(...data.map(Math.abs), 0.01);
+  const yS = (v) => pad.t + h / 2 - (v / max) * (h / 2);
+  const xS = (i) => pad.l + (i / (data.length - 1)) * w;
+
+  if (fillBar) {
+    const bw = w / data.length * 0.65;
+    return (
+      <RSVG vw={vw} vh={vh}>
+        <text x={pad.l} y={11} fill="#8a8a9a" fontSize="9" fontFamily="monospace">{label}</text>
+        <line x1={pad.l} y1={yS(0)} x2={vw - pad.r} y2={yS(0)} stroke="#333" strokeWidth="0.8" />
+        {data.map((v, i) => {
+          const bx = pad.l + (i / data.length) * w + w / data.length * 0.17;
+          return <rect key={i} x={bx} y={v >= 0 ? yS(v) : yS(0)} width={bw}
+            height={Math.max(Math.abs(yS(v) - yS(0)), 1)}
+            fill={v >= 0 ? "#4ade80" : "#f87171"} opacity="0.8" rx="1" />;
+        })}
+        {data.map((_, i) => (
+          <text key={i} x={pad.l + (i / data.length) * w + w / data.length / 2}
+            y={vh - 3} fill="#666" fontSize="7" textAnchor="middle" fontFamily="monospace">
+            {i + startIndex}
+          </text>
+        ))}
+      </RSVG>
+    );
+  }
+
+  const path = data.map((v, i) =>
+    `${i === 0 ? "M" : "L"}${xS(i).toFixed(1)},${yS(v).toFixed(1)}`).join(" ");
+  return (
+    <RSVG vw={vw} vh={vh}>
+      <text x={pad.l} y={11} fill="#8a8a9a" fontSize="9" fontFamily="monospace">{label}</text>
+      <line x1={pad.l} y1={yS(0)} x2={vw - pad.r} y2={yS(0)} stroke="#333" strokeWidth="0.8" />
+      <path d={path} fill="none" stroke={color} strokeWidth="1.5" opacity="0.7" />
+      {data.map((v, i) => (
+        <circle key={i} cx={xS(i)} cy={yS(v)} r={2.5} fill={color} />
+      ))}
+      {data.map((_, i) => (
+        <text key={i} x={xS(i)} y={vh - 3} fill="#666" fontSize="7" textAnchor="middle" fontFamily="monospace">
+          {i + startIndex}
+        </text>
+      ))}
+    </RSVG>
+  );
+}
+
+/* ───────────── 2-cycle signal graph with window highlights ───────────── */
+function SignalGraph({ signal, components }) {
+  const vw = 460, vh = 115;
+  const pad = { t: 18, b: 28, l: 34, r: 10 };
+  const w = vw - pad.l - pad.r;
+  const h = vh - pad.t - pad.b;
+  const xS = (i) => pad.l + (i / (TOTAL - 1)) * w;
+
+  // Continuous curve
+  const fineVals = [];
+  for (let i = 0; i <= 400; i++) {
+    const t = (i / 400) * (TOTAL - 1);
+    let val = 0;
+    for (const c of components) val += c.amp * Math.sin((TAU * c.freq * t) / N);
+    fineVals.push({ t, val });
+  }
+  const max = Math.max(...signal.map(Math.abs), ...fineVals.map(p => Math.abs(p.val)), 0.01);
+  const yS = (v) => pad.t + h / 2 - (v / max) * (h / 2);
+  const curve = fineVals.map((p, i) => {
+    const x = pad.l + (p.t / (TOTAL - 1)) * w;
+    return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${yS(p.val).toFixed(1)}`;
+  }).join(" ");
+
+  // Window regions
+  const reX0 = xS(0), reX1 = xS(N - 1);
+  const imX0 = xS(N4), imX1 = xS(N4 + N - 1);
+
+  return (
+    <RSVG vw={vw} vh={vh}>
+      <text x={pad.l} y={12} fill="#38bdf8" fontSize="10" fontFamily="monospace" fontWeight="bold">
+        x[n] — 2 ciclos ({TOTAL} amostras, N={N}/ciclo)
+      </text>
+
+      {/* Window highlight: Real (n=0..15) */}
+      <rect x={reX0} y={pad.t} width={reX1 - reX0} height={h}
+        fill="#4ade80" opacity="0.06" stroke="#4ade80" strokeWidth="0.6" strokeDasharray="3 2" rx="2" />
+      <text x={reX0 + 3} y={pad.t + 10} fill="#4ade80" fontSize="7" fontFamily="monospace" opacity="0.7">
+        Re: n=0…{N - 1}
+      </text>
+
+      {/* Window highlight: Imag (n=4..19) */}
+      <rect x={imX0} y={pad.t} width={imX1 - imX0} height={h}
+        fill="#f472b6" opacity="0.06" stroke="#f472b6" strokeWidth="0.6" strokeDasharray="3 2" rx="2" />
+      <text x={imX1 - 2} y={pad.t + h - 4} fill="#f472b6" fontSize="7" fontFamily="monospace" opacity="0.7" textAnchor="end">
+        Im: n={N4}…{N4 + N - 1}
+      </text>
+
+      <line x1={pad.l} y1={yS(0)} x2={vw - pad.r} y2={yS(0)} stroke="#333" strokeWidth="0.8" />
+      <path d={curve} fill="none" stroke="#38bdf8" strokeWidth="1.1" opacity="0.3" />
+
+      {/* Cycle separator */}
+      <line x1={xS(N)} y1={pad.t} x2={xS(N)} y2={pad.t + h} stroke="#555" strokeWidth="0.6" strokeDasharray="4 3" />
+      <text x={xS(N)} y={pad.t + h + 10} fill="#555" fontSize="7" fontFamily="monospace" textAnchor="middle">
+        ← ciclo 1 | ciclo 2 →
+      </text>
+
+      {signal.map((v, i) => {
+        // Color dots by which window they belong to
+        let dotColor = "#38bdf8";
+        const inRe = i >= 0 && i <= N - 1;
+        const inIm = i >= N4 && i <= N4 + N - 1;
+        if (inRe && inIm) dotColor = "#c084fc"; // overlap region
+        else if (inRe) dotColor = "#4ade80";
+        else if (inIm) dotColor = "#f472b6";
+        else dotColor = "#38bdf8";
+
+        return (
+          <g key={i}>
+            <line x1={xS(i)} y1={yS(0)} x2={xS(i)} y2={yS(v)} stroke={dotColor} strokeWidth="0.6" opacity="0.25" />
+            <circle cx={xS(i)} cy={yS(v)} r={2.8} fill={dotColor} opacity={0.9} />
+          </g>
+        );
+      })}
+      {signal.map((_, i) => (
+        <text key={i} x={xS(i)} y={vh - 8} fill="#555" fontSize="6.5" textAnchor="middle" fontFamily="monospace">
+          {i}
+        </text>
+      ))}
+
+      {/* Legend */}
+      <text x={vw - pad.r} y={vh - 1} fill="#555" fontSize="7" fontFamily="monospace" textAnchor="end">
+        <tspan fill="#4ade80">● Re</tspan>{"  "}
+        <tspan fill="#f472b6">● Im</tspan>{"  "}
+        <tspan fill="#c084fc">● ambos</tspan>
+      </text>
+    </RSVG>
+  );
+}
+
+/* ───────────── Spectrum ───────────── */
+function SpectrumGraph({ magnitudes, activeH }) {
+  const vw = 460, vh = 110;
+  const pad = { t: 20, b: 24, l: 34, r: 10 };
+  const w = vw - pad.l - pad.r;
+  const h = vh - pad.t - pad.b;
+  const numBins = Math.floor(N / 2) + 1; // 0..8 (só metade útil)
+  const max = Math.max(...magnitudes.slice(0, numBins), 0.1);
+  const bw = w / numBins * 0.6;
+
+  return (
+    <RSVG vw={vw} vh={vh}>
+      <text x={pad.l} y={13} fill="#c084fc" fontSize="10" fontFamily="monospace" fontWeight="bold">
+        |X[h]| — Espectro (h=0…{N / 2}, bins úteis)
+      </text>
+      <line x1={pad.l} y1={pad.t + h} x2={vw - pad.r} y2={pad.t + h} stroke="#444" strokeWidth="0.8" />
+      {magnitudes.slice(0, numBins).map((m, k) => {
+        const bx = pad.l + (k / numBins) * w + w / numBins * 0.2;
+        const bh = (m / max) * h;
+        const active = k === activeH;
+        const harm = COMPONENTS.some(c => c.freq === k);
+        const fill = active ? "#c084fc" : harm ? "#818cf8" : "#444";
+        return (
+          <g key={k}>
+            <rect x={bx} y={pad.t + h - bh} width={bw} height={Math.max(bh, 1)}
+              fill={fill} rx="2" opacity={active ? 1 : 0.7} />
+            {m > 0.05 && <text x={bx + bw / 2} y={pad.t + h - bh - 3}
+              fill={active ? "#c084fc" : "#999"} fontSize="8" textAnchor="middle" fontFamily="monospace">
+              {m.toFixed(2)}</text>}
+          </g>
+        );
+      })}
+      {magnitudes.slice(0, numBins).map((_, k) => (
+        <text key={k}
+          x={pad.l + (k / numBins) * w + w / numBins / 2}
+          y={vh - 5} fill={k === activeH ? "#c084fc" : "#777"}
+          fontSize="8" textAnchor="middle" fontFamily="monospace"
+          fontWeight={k === activeH ? "bold" : "normal"}>h={k}</text>
+      ))}
+    </RSVG>
+  );
+}
+
+/* ───────────── Phasor diagram ───────────── */
+function PhasorDiagram({ cosFilter, h }) {
+  const vw = 460, vh = 345;
+  const cx = vw / 2, cy = 150;
+  const R = 100;
+  const { realPart, imagPart, mag, angleDeg } = cosFilter;
+
+  const scale = mag > 0.01 ? R / mag : R;
+  const px = cx + realPart * scale;
+  const py = cy - imagPart * scale;
+
+  const angleRad = Math.atan2(imagPart, realPart);
+  const arcR = 28;
+  const arcEx = cx + arcR, arcEy = cy;
+  const arcSx = cx + arcR * Math.cos(-angleRad);
+  const arcSy = cy + arcR * Math.sin(-angleRad);
+  const large = Math.abs(angleDeg) > 180 ? 1 : 0;
+  const sweep = angleDeg >= 0 ? 0 : 1;
+  const arcD = `M ${arcEx},${arcEy} A ${arcR},${arcR} 0 ${large},${sweep} ${arcSx.toFixed(1)},${arcSy.toFixed(1)}`;
+
+  return (
+    <RSVG vw={vw} vh={vh}>
+      <text x={14} y={16} fill="#fbbf24" fontSize="10" fontFamily="monospace" fontWeight="bold">
+        Diagrama Fasorial — Filtro Cosseno (h={h})
+      </text>
+
+      {[0.25, 0.5, 0.75, 1].map((f, i) => (
+        <circle key={i} cx={cx} cy={cy} r={R * f} fill="none" stroke="#1e1e3a" strokeWidth="0.6" />
+      ))}
+      <circle cx={cx} cy={cy} r={R} fill="none" stroke="#3a3a5a" strokeWidth="0.8" strokeDasharray="4 3" />
+
+      <line x1={cx - R - 16} y1={cy} x2={cx + R + 16} y2={cy} stroke="#333" strokeWidth="0.8" />
+      <line x1={cx} y1={cy - R - 16} x2={cx} y2={cy + R + 16} stroke="#333" strokeWidth="0.8" />
+      <text x={cx + R + 18} y={cy + 3.5} fill="#4ade80" fontSize="9" fontFamily="monospace">Re</text>
+      <text x={cx + 3} y={cy - R - 18} fill="#f472b6" fontSize="9" fontFamily="monospace">Im</text>
+
+      {mag > 0.03 && (
+        <>
+          <line x1={cx} y1={cy} x2={px} y2={cy} stroke="#4ade80" strokeWidth="2.2" opacity="0.7" />
+          <line x1={px} y1={cy} x2={px} y2={py} stroke="#4ade80" strokeWidth="0.8" strokeDasharray="3 2" opacity="0.4" />
+          <line x1={cx} y1={cy} x2={cx} y2={py} stroke="#f472b6" strokeWidth="2.2" opacity="0.7" />
+          <line x1={cx} y1={py} x2={px} y2={py} stroke="#f472b6" strokeWidth="0.8" strokeDasharray="3 2" opacity="0.4" />
+
+          <path d={arcD} fill="none" stroke="#fbbf24" strokeWidth="1.2" opacity="0.85" />
+          {Math.abs(angleDeg) > 3 && (
+            <text
+              x={cx + (arcR + 11) * Math.cos(-angleRad / 2)}
+              y={cy + (arcR + 11) * Math.sin(-angleRad / 2) + 3}
+              fill="#fbbf24" fontSize="9.5" fontFamily="monospace" textAnchor="middle">
+              {angleDeg.toFixed(1)}°
+            </text>
+          )}
+
+          <line x1={cx} y1={cy} x2={px} y2={py} stroke="#e9d5ff" strokeWidth="2.5" />
+          {(() => {
+            const dx = px - cx, dy = py - cy;
+            const len = Math.sqrt(dx * dx + dy * dy);
+            if (len < 5) return null;
+            const ux = dx / len, uy = dy / len;
+            const pX = -uy, pY = ux;
+            const ts = 7;
+            return <polygon
+              points={`${px},${py} ${px - ux * ts + pX * ts * 0.38},${py - uy * ts + pY * ts * 0.38} ${px - ux * ts - pX * ts * 0.38},${py - uy * ts - pY * ts * 0.38}`}
+              fill="#e9d5ff" />;
+          })()}
+          <circle cx={px} cy={py} r={3.5} fill="#c084fc" stroke="#e9d5ff" strokeWidth="1.5" />
+
+          <text x={px} y={cy + 13} fill="#4ade80" fontSize="8.5" fontFamily="monospace" textAnchor="middle">
+            {realPart.toFixed(3)}
+          </text>
+          <text x={cx - 5} y={py + 3} fill="#f472b6" fontSize="8.5" fontFamily="monospace" textAnchor="end">
+            {imagPart.toFixed(3)}
+          </text>
+          <text x={(cx + px) / 2 + 8} y={(cy + py) / 2 - 7}
+            fill="#e9d5ff" fontSize="9.5" fontFamily="monospace" fontWeight="bold">
+            |V|={mag.toFixed(3)}
+          </text>
+        </>
+      )}
+
+      <rect x={14} y={vh - 62} width={vw - 28} height={52} rx="5" fill="#111128" stroke="#2a2a4a" strokeWidth="0.8" />
+      <text x={24} y={vh - 44} fill="#8a8a9a" fontSize="8.5" fontFamily="monospace">
+        <tspan fill="#4ade80">Re</tspan>{" = (2/N)·Σ x[n]·cos(2πh·n/N)    n=0…"}{N - 1}{" → "}
+        <tspan fill="#4ade80">{realPart.toFixed(4)}</tspan>
+      </text>
+      <text x={24} y={vh - 30} fill="#8a8a9a" fontSize="8.5" fontFamily="monospace">
+        <tspan fill="#f472b6">Im</tspan>{" = -(2/N)·Σ x[n+"}{N4}{"]·cos(2πh·n/N) n=0…"}{N - 1}{" → "}
+        <tspan fill="#f472b6">{imagPart.toFixed(4)}</tspan>
+      </text>
+      <text x={24} y={vh - 16} fill="#e9d5ff" fontSize="9.5" fontFamily="monospace" fontWeight="bold">
+        |V| = {mag.toFixed(4)}   φ = {angleDeg.toFixed(1)}°
+      </text>
+    </RSVG>
+  );
+}
+
+/* ───────────── Frequency Response Graph ───────────── */
+function FreqResponseGraph({ activeH }) {
+  const vw = 460, vh = 160;
+  const pad = { t: 20, b: 26, l: 34, r: 14 };
+  const w = vw - pad.l - pad.r;
+  const h = vh - pad.t - pad.b;
+  const maxF = N / 2;
+
+  const resp = useMemo(() => computeFreqResponse(activeH, 500), [activeH]);
+  const maxMag = Math.max(...resp.map(p => p.mag), 0.01);
+
+  const xS = (f) => pad.l + (f / maxF) * w;
+  const yS = (m) => pad.t + h - (m / maxMag) * h;
+
+  const curvePath = resp.map((p, i) =>
+    `${i === 0 ? "M" : "L"}${xS(p.f).toFixed(1)},${yS(p.mag).toFixed(1)}`
+  ).join(" ");
+  const fillPath = curvePath + ` L${xS(maxF).toFixed(1)},${(pad.t + h).toFixed(1)} L${pad.l},${(pad.t + h).toFixed(1)} Z`;
+
+  const intFreqs = [];
+  for (let i = 0; i <= maxF; i++) intFreqs.push(i);
+
+  const col = "#22d3ee";
+
+  return (
+    <RSVG vw={vw} vh={vh}>
+      <text x={pad.l} y={13} fill={col} fontSize="10" fontFamily="monospace" fontWeight="bold">
+        Resposta na Frequência — Filtro Cosseno (h={activeH})
+      </text>
+
+      {[0.2, 0.4, 0.6, 0.8, 1.0].map(v => {
+        const y = yS(v * maxMag);
+        return (
+          <g key={v}>
+            <line x1={pad.l} y1={y} x2={vw - pad.r} y2={y} stroke="#1a1a2e" strokeWidth="0.5" />
+            <text x={pad.l - 3} y={y + 3} fill="#444" fontSize="7" textAnchor="end" fontFamily="monospace">
+              {(v * maxMag).toFixed(1)}
+            </text>
+          </g>
+        );
+      })}
+
+      <line x1={pad.l} y1={pad.t + h} x2={vw - pad.r} y2={pad.t + h} stroke="#444" strokeWidth="0.8" />
+
+      {intFreqs.map(f => (
+        <line key={f} x1={xS(f)} y1={pad.t} x2={xS(f)} y2={pad.t + h}
+          stroke={f === activeH ? col : "#1a1a2e"} strokeWidth={f === activeH ? 1 : 0.5}
+          strokeDasharray={f === activeH ? "none" : "2 3"} />
+      ))}
+
+      <path d={fillPath} fill={col} opacity="0.08" />
+      <path d={curvePath} fill="none" stroke={col} strokeWidth="1.8" opacity="0.9" />
+
+      {intFreqs.map(f => {
+        const pt = resp.find(p => Math.abs(p.f - f) < 0.02);
+        if (!pt) return null;
+        const isT = f === activeH;
+        return (
+          <g key={f}>
+            <circle cx={xS(f)} cy={yS(pt.mag)} r={isT ? 4.5 : 3}
+              fill={isT ? col : pt.mag > 0.01 ? "#555" : "#333"}
+              stroke={isT ? "#fff" : "none"} strokeWidth={isT ? 1.5 : 0} />
+            {(isT || pt.mag > 0.05) && (
+              <text x={xS(f)} y={yS(pt.mag) - 7}
+                fill={isT ? col : "#666"} fontSize="7.5"
+                textAnchor="middle" fontFamily="monospace" fontWeight={isT ? "bold" : "normal"}>
+                {pt.mag.toFixed(2)}
+              </text>
+            )}
+          </g>
+        );
+      })}
+
+      {intFreqs.map(f => (
+        <text key={f} x={xS(f)} y={vh - 6}
+          fill={f === activeH ? col : "#666"} fontSize="7.5"
+          textAnchor="middle" fontFamily="monospace"
+          fontWeight={f === activeH ? "bold" : "normal"}>{f}</text>
+      ))}
+      <text x={vw / 2} y={vh - 0} fill="#555" fontSize="7" textAnchor="middle" fontFamily="monospace">
+        Múltiplo da Frequência Fundamental
+      </text>
+    </RSVG>
+  );
+}
+
+/* ═══════════════ Main ═══════════════ */
+function CosineFilterExplorer() {
+  const [h, setH] = useState(1);
+  const [showFormula, setShowFormula] = useState(true);
+  const [activeComps, setActiveComps] = useState([0, 2, 3]);
+
+  const toggleComp = (idx) => {
+    setActiveComps(prev => prev.includes(idx) ? prev.filter(i => i !== idx) : [...prev, idx].sort());
+  };
+
+  const components = COMPONENTS.filter((_, i) => activeComps.includes(i));
+  const signal32 = useMemo(() => generateSignal(components), [activeComps]);
+  const cosFilter = useMemo(() => computeCosineFilter(signal32, h), [signal32, h]);
+  const allMags = useMemo(() => {
+    const m = [];
+    for (let i = 0; i <= N / 2; i++) m.push(computeCosineFilter(signal32, i).mag);
+    return m;
+  }, [signal32]);
+
+  const sec = {
+    background: "#0f0f1f",
+    border: "1px solid #2a2a4a",
+    borderRadius: 8,
+    padding: "12px 10px",
+    marginBottom: 12,
+    overflow: "hidden",
+  };
+
+  return (
+    <div style={{
+      background: "#0c0c14", color: "#e2e2ea", minHeight: "100vh",
+      fontFamily: "'JetBrains Mono','Fira Code','SF Mono',monospace",
+      padding: "20px 16px", maxWidth: 620, margin: "0 auto",
+      boxSizing: "border-box", overflowX: "hidden",
+    }}>
+      <h1 style={{ fontSize: 17, fontWeight: 700, color: "#22d3ee", margin: "0 0 4px" }}>
+        Filtro Cosseno — Estimador de Fasor
+      </h1>
+      <p style={{ fontSize: 10.5, color: "#8a8a9a", margin: "0 0 16px", lineHeight: 1.5 }}>
+        Extração de harmônicas usando apenas cosseno com deslocamento de N/4
+      </p>
+
+      {/* Formula toggle */}
+      <button onClick={() => setShowFormula(!showFormula)} style={{
+        background: showFormula ? "#1e1b4b" : "#1a1a2e",
+        border: "1px solid #333", color: "#22d3ee",
+        padding: "6px 12px", borderRadius: 6, fontSize: 11,
+        cursor: "pointer", marginBottom: 12,
+      }}>
+        {showFormula ? "▾" : "▸"} Fórmulas do Filtro Cosseno
+      </button>
+
+      {showFormula && (
+        <div style={{
+          background: "#111128", border: "1px solid #2a2a4a", borderRadius: 8,
+          padding: "12px 14px", marginBottom: 16, fontSize: 10.5, lineHeight: 2,
+        }}>
+          <div style={{ color: "#22d3ee", fontWeight: 700, marginBottom: 4, fontSize: 11 }}>
+            Filtro Cosseno (full-cycle):
+          </div>
+          <div style={{ color: "#8a8a9a" }}>
+            <span style={{ color: "#4ade80" }}>X_Re[h]</span> = (2/N)·Σ x[n]·cos(2πhn/N)
+            <span style={{ color: "#555" }}> — n=0…{N - 1}</span>
+          </div>
+          <div style={{ color: "#8a8a9a" }}>
+            <span style={{ color: "#f472b6" }}>X_Im[h]</span> = −(2/N)·Σ x[n+<strong style={{ color: "#e2e2ea" }}>N/4</strong>]·cos(2πhn/N)
+            <span style={{ color: "#555" }}> — amostras {N4}…{N4 + N - 1}</span>
+          </div>
+          <div style={{ color: "#666", fontSize: 9.5, marginTop: 6, fontStyle: "italic" }}>
+            A parte imaginária usa o mesmo cosseno, mas aplicado ao sinal
+            deslocado de N/4 = {N4} amostras (90° da fundamental).
+          </div>
+          <div style={{ color: "#555", fontSize: 9, marginTop: 4 }}>
+            Requer N + N/4 = {N + N4} amostras contíguas do sinal.
+          </div>
+        </div>
+      )}
+
+      {/* Component toggles */}
+      <div style={{ marginBottom: 12, display: "flex", gap: 5, flexWrap: "wrap" }}>
+        {COMPONENTS.map((c, i) => (
+          <button key={i} onClick={() => toggleComp(i)} style={{
+            background: activeComps.includes(i) ? "#1e1b4b" : "#1a1a2e",
+            border: activeComps.includes(i) ? "1px solid #818cf8" : "1px solid #333",
+            color: activeComps.includes(i) ? "#818cf8" : "#666",
+            padding: "4px 8px", borderRadius: 6, fontSize: 9.5, cursor: "pointer",
+          }}>
+            {c.label} {activeComps.includes(i) ? "✓" : ""}
+          </button>
+        ))}
+      </div>
+
+      {/* 2-cycle signal */}
+      <SignalGraph signal={signal32} components={components} />
+
+      {/* Harmonic selector */}
+      <div style={{
+        background: "#111128", border: "1px solid #2a2a4a", borderRadius: 8,
+        padding: "10px 14px", margin: "12px 0",
+      }}>
+        <div style={{ fontSize: 11, color: "#22d3ee", fontWeight: 600, marginBottom: 8 }}>
+          Selecione a harmônica h = {h}
+        </div>
+        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+          {Array.from({ length: N / 2 + 1 }, (_, i) => {
+            const isHarm = COMPONENTS.some(c => c.freq === i);
+            return (
+              <button key={i} onClick={() => setH(i)} style={{
+                width: 38, height: 30,
+                background: i === h ? "#22d3ee" : "#1a1a2e",
+                color: i === h ? "#0c0c14" : isHarm ? "#818cf8" : "#888",
+                border: i === h ? "none" : isHarm ? "1px solid #4c3d9a" : "1px solid #333",
+                borderRadius: 5, fontSize: 11,
+                fontWeight: i === h ? 700 : 400, cursor: "pointer",
+              }}>
+                {i}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* ── Cosine filter step-by-step ── */}
+      <div style={sec}>
+        <div style={{ fontSize: 12, color: "#e2e2ea", fontWeight: 600, marginBottom: 10 }}>
+          Filtro Cosseno — Passo a passo para h = {h}
+        </div>
+
+        {/* === PARTE REAL === */}
+        <div style={{
+          background: "#0a1a0a", border: "1px solid #1a3a1a", borderRadius: 6,
+          padding: "8px 8px 4px", marginBottom: 10,
+        }}>
+          <div style={{ fontSize: 10.5, color: "#4ade80", marginBottom: 4, fontWeight: 700 }}>
+            PARTE REAL — x[n], n = 0…{N - 1}
+          </div>
+
+          <div style={{ fontSize: 9.5, color: "#8a8a9a", marginBottom: 2, fontWeight: 600 }}>
+            ① Amostras do 1º ciclo: x[0]…x[{N - 1}]
+          </div>
+          <MiniGraph data={cosFilter.samplesRe} color="#38bdf8" label={`x[n], n=0…${N - 1}`} startIndex={0} />
+
+          <div style={{ fontSize: 9.5, color: "#4ade80", margin: "6px 0 2px", fontWeight: 600 }}>
+            ② Cosseno de teste: cos(2π·{h}·n/{N})
+          </div>
+          <MiniGraph data={cosFilter.cosVals} color="#4ade80" label={`cos(2π·${h}·n/${N})`} />
+
+          <div style={{ fontSize: 9.5, color: "#fbbf24", margin: "6px 0 2px", fontWeight: 600 }}>
+            ③ Produto: x[n] × cos(2π·{h}·n/{N})
+          </div>
+          <MiniGraph data={cosFilter.prodRe} color="#fbbf24" label="x[n]·cos" fillBar />
+
+          <div style={{
+            fontSize: 11, color: "#4ade80", padding: "4px 8px",
+            background: "#0c0c14", borderRadius: 4, margin: "4px 0 4px", display: "inline-block",
+          }}>
+            Re = (2/{N})·{cosFilter.reSumRaw.toFixed(3)} = {cosFilter.realPart.toFixed(4)}
+          </div>
+        </div>
+
+        {/* === PARTE IMAGINÁRIA === */}
+        <div style={{
+          background: "#1a0a1a", border: "1px solid #3a1a3a", borderRadius: 6,
+          padding: "8px 8px 4px", marginBottom: 10,
+        }}>
+          <div style={{ fontSize: 10.5, color: "#f472b6", marginBottom: 4, fontWeight: 700 }}>
+            PARTE IMAGINÁRIA — x[n+{N4}], n = 0…{N - 1} → amostras [{N4}…{N4 + N - 1}]
+          </div>
+
+          <div style={{ fontSize: 9.5, color: "#8a8a9a", marginBottom: 2, fontWeight: 600 }}>
+            ④ Amostras deslocadas: x[{N4}]…x[{N4 + N - 1}]
+          </div>
+          <MiniGraph data={cosFilter.samplesIm} color="#f472b6" label={`x[n+${N4}], n=0…${N - 1}`} startIndex={N4} />
+
+          <div style={{ fontSize: 9.5, color: "#4ade80", margin: "6px 0 2px", fontWeight: 600 }}>
+            ⑤ Mesmo cosseno: cos(2π·{h}·n/{N})
+          </div>
+          <MiniGraph data={cosFilter.cosVals} color="#4ade80" label={`cos(2π·${h}·n/${N}) (igual)`} />
+
+          <div style={{ fontSize: 9.5, color: "#fb923c", margin: "6px 0 2px", fontWeight: 600 }}>
+            ⑥ Produto: x[n+{N4}] × cos(2π·{h}·n/{N})
+          </div>
+          <MiniGraph data={cosFilter.prodIm} color="#fb923c" label={`x[n+${N4}]·cos`} fillBar startIndex={N4} />
+
+          <div style={{
+            fontSize: 11, color: "#f472b6", padding: "4px 8px",
+            background: "#0c0c14", borderRadius: 4, margin: "4px 0 4px", display: "inline-block",
+          }}>
+            Im = −(2/{N})·{cosFilter.imSumRaw.toFixed(3)} = {cosFilter.imagPart.toFixed(4)}
+          </div>
+        </div>
+
+        {/* Result box */}
+        <div style={{
+          background: "#1a1035", border: "1px solid #4c1d95", borderRadius: 8,
+          padding: "10px 12px",
+        }}>
+          <div style={{ fontSize: 12, color: "#22d3ee", fontWeight: 700, marginBottom: 4 }}>
+            Resultado do Filtro Cosseno para h = {h}:
+          </div>
+          <div style={{ fontSize: 11, lineHeight: 1.8 }}>
+            <span style={{ color: "#4ade80" }}>Re = {cosFilter.realPart.toFixed(4)}</span>
+            {" · "}
+            <span style={{ color: "#f472b6" }}>Im = {cosFilter.imagPart.toFixed(4)}</span>
+          </div>
+          <div style={{ fontSize: 13, color: "#e9d5ff", fontWeight: 700 }}>
+            |X[{h}]| = {cosFilter.mag.toFixed(4)}   φ = {cosFilter.angleDeg.toFixed(1)}°
+          </div>
+          <div style={{ fontSize: 10, color: "#8a8a9a", marginTop: 4 }}>
+            {cosFilter.mag > 0.05
+              ? `⚡ Harmônica h=${h} detectada com amplitude ${cosFilter.mag.toFixed(3)}.`
+              : `≈ 0 → Sem energia significativa nesta harmônica.`}
+          </div>
+        </div>
+      </div>
+
+      {/* Phasor diagram */}
+      <div style={sec}>
+        <PhasorDiagram cosFilter={cosFilter} h={h} />
+
+        <div style={{
+          background: "#1a1520", border: "1px solid #3a2a4a", borderRadius: 6,
+          padding: "8px 10px", marginTop: 8,
+          fontSize: 9.5, lineHeight: 1.8, color: "#9a9ab0",
+        }}>
+          <div style={{ color: "#22d3ee", fontWeight: 600, marginBottom: 2 }}>
+            Por que o deslocamento de N/4 funciona?
+          </div>
+          <div>
+            Deslocar o sinal de N/4 = {N4} amostras equivale a um atraso
+            de 90° na fundamental. Isso transforma cos → −sin no argumento
+            do sinal. Assim, correlacionar x[n+N/4] com cos extrai a mesma
+            informação que correlacionar x[n] com sin — mas usando apenas
+            cosseno como base.
+          </div>
+        </div>
+      </div>
+
+      {/* Spectrum */}
+      <SpectrumGraph magnitudes={allMags} activeH={h} />
+
+      {/* Frequency Response */}
+      <div style={sec}>
+        <FreqResponseGraph activeH={h} />
+        <div style={{
+          fontSize: 9.5, lineHeight: 1.7, color: "#8a8a9a", marginTop: 6, padding: "0 4px",
+        }}>
+          Resposta do filtro cosseno (deslocamento N/4) sintonizado em h={h}.
+          Note que para harmônicas pares (h=2, 4, 6) o ganho é zero — limitação
+          do deslocamento temporal fixo de N/4 amostras.
+        </div>
+      </div>
+
+      {/* Explanation */}
+      <div style={{
+        background: "#111128", border: "1px solid #2a2a4a", borderRadius: 8,
+        padding: "12px 14px", marginTop: 12,
+        fontSize: 10.5, lineHeight: 1.7, color: "#9a9ab0",
+      }}>
+        <div style={{ color: "#22d3ee", fontWeight: 700, fontSize: 11, marginBottom: 4 }}>
+          Filtro Cosseno vs DFT vs Filtro Fourier
+        </div>
+        <p style={{ margin: "0 0 6px" }}>
+          O <strong style={{ color: "#e2e2ea" }}>Filtro Cosseno</strong> usa apenas cos como função-base.
+          A parte imaginária vem do <strong style={{ color: "#e2e2ea" }}>deslocamento temporal</strong> de
+          N/4 amostras, não de sin como na DFT.
+        </p>
+        <p style={{ margin: "0 0 6px" }}>
+          <strong style={{ color: "#e2e2ea" }}>Vantagem computacional:</strong> só precisa calcular e armazenar
+          uma tabela de cossenos (N valores), enquanto a DFT completa precisa de cos e sin (2N valores).
+          Em microprocessadores de relés, isso reduz memória e ciclos de clock.
+        </p>
+        <p style={{ margin: 0 }}>
+          <strong style={{ color: "#e2e2ea" }}>Custo:</strong> precisa de N + N/4 = {N + N4} amostras
+          contíguas em vez de apenas N, introduzindo {((N4 / N) * 100 / 60 * 1000).toFixed(1)} ms
+          de latência adicional a 60 Hz (com N={N}).
+        </p>
+      </div>
+
+      <div style={{ fontSize: 9, color: "#555", textAlign: "center", marginTop: 16, paddingBottom: 20 }}>
+        Filtro Cosseno · N={N} amostras/ciclo · 2 ciclos ({TOTAL} amostras) ·
+        Re: n=0…{N - 1} · Im: n={N4}…{N4 + N - 1}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(CosineFilterExplorer));
+</script>
+</body>
+</html>
